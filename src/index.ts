@@ -3,7 +3,7 @@ import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 
 /**
- * Portrait AI Director MCP v0.2 – stateless project continuity.
+ * Portrait AI Director MCP v0.2.1 – retained review flags.
  *
  * SECURITY: The endpoint is still public and unauthenticated. Do not send real
  * client data. No session state or project information is stored on the server.
@@ -37,6 +37,7 @@ const stateSchema = z.object({
   concept: z.string().max(1200),
   revision: z.number().int().min(0).max(9999),
   decisions: z.record(z.string(), z.string()),
+  needs_review: z.array(z.enum(stepKeys)).optional(), // accepts existing v0.2 state_json
 }).strict();
 
 type ProjectState = z.infer<typeof stateSchema>;
@@ -52,7 +53,7 @@ const guidance = [
 ];
 
 function parseState(raw: string): ProjectState {
-  if (raw.length > 16000) throw new Error("Project state exceeds the 16,000-character demo limit.");
+  if (raw.length > 24000) throw new Error("Project state exceeds the 16,000-character demo limit.");
   let json: unknown;
   try {
     json = JSON.parse(raw);
@@ -66,28 +67,23 @@ function parseState(raw: string): ProjectState {
       throw new Error(`Invalid project decision: ${key}`);
     }
   }
-  return parsed.data;
+  return { ...parsed.data, needs_review: parsed.data.needs_review ?? [] };
 }
 
-function report(state: ProjectState, changedStep?: StepKey, previousDecision?: string) {
+function report(state: ProjectState, changedStep?: StepKey) {
   const completed = planningSteps.filter((step) => Boolean(state.decisions[step.key]));
   const missing = planningSteps.filter((step) => !state.decisions[step.key]);
   const next = missing[0] ?? null;
-  const changedIndex = changedStep ? planningSteps.findIndex((s) => s.key === changedStep) : -1;
-  const reviewRecommended = changedStep && previousDecision !== undefined
-    ? planningSteps.slice(changedIndex + 1)
-        .filter((step) => Boolean(state.decisions[step.key]))
-        .map((step) => step.label)
-    : [];
+  const needsReview = (state.needs_review ?? [])
+    .filter((key) => Boolean(state.decisions[key]));
 
   return {
     title: state.title,
     concept: state.concept,
     revision: state.revision,
-    status: next ? "in_progress" : "ready_for_review",
+    status: missing.length ? "in_progress" : needsReview.length ? "needs_review" : "ready_for_review",
     stored_on_server: false,
-    // IMPORTANT: supply this complete value as state_json on the next call.
-    state_json: JSON.stringify(state),
+    state_json: JSON.stringify({ ...state, needs_review: needsReview }),
     decisions: state.decisions,
     progress: {
       completed: completed.length,
@@ -95,11 +91,11 @@ function report(state: ProjectState, changedStep?: StepKey, previousDecision?: s
       completed_steps: completed.map((step) => step.label),
       missing_steps: missing.map((step) => step.label),
     },
-    next_step: next
-      ? { key: next.key, label: next.label, question: next.question }
-      : null,
+    next_step: next ? { key: next.key, label: next.label, question: next.question } : null,
     revised_step: changedStep ?? null,
-    later_decisions_to_review: reviewRecommended,
+    later_decisions_to_review: planningSteps
+      .filter((step) => needsReview.includes(step.key))
+      .map((step) => step.label),
     creative_guidance: guidance,
     warning: "Public, unauthenticated prototype. Do not submit personal client information. State survives only when the caller retains and resubmits state_json.",
   };
@@ -119,7 +115,7 @@ function errorResult(message: string) {
 function createServer() {
   const server = new McpServer({
     name: "Portrait AI Director - MCP Prototype",
-    version: "0.2.0",
+    version: "0.2.1",
   });
 
   // Retain the original tools for a known-good MCP connection test.
@@ -165,6 +161,7 @@ function createServer() {
         concept: concept ?? "",
         revision: 0,
         decisions: {},
+        needs_review: [],
       };
       return textResult(report(state));
     },
@@ -177,7 +174,7 @@ function createServer() {
       description:
         "Save or revise ONE user-approved decision in a PAD project. Pass state_json EXACTLY from the previous PAD response. Pass step (enum key) and decision (text). Empty decision clears that stage. Returns NEW state_json; use it for every later call. Never silently alter other decisions.",
       inputSchema: z.object({
-        state_json: z.string().min(1).max(16000),
+        state_json: z.string().min(1).max(24000),
         step: z.enum(stepKeys),
         decision: z.string().trim().max(1200),
       }),
@@ -190,12 +187,23 @@ function createServer() {
         const decisions = { ...oldState.decisions };
         if (decision) decisions[step] = decision;
         else delete decisions[step];
+        const pending = new Set(oldState.needs_review ?? []);
+        // Explicitly revisiting a step confirms or clears its own review flag.
+        pending.delete(step);
+        // All later, already-approved steps need review if an earlier decision changes.
+        if ((previous ?? "") !== decision) {
+          const index = planningSteps.findIndex((s) => s.key === step);
+          for (const later of planningSteps.slice(index + 1)) {
+            if (decisions[later.key]) pending.add(later.key);
+          }
+        }
         const updated: ProjectState = {
           ...oldState,
           revision: oldState.revision + 1,
           decisions,
+          needs_review: planningSteps.map((s) => s.key).filter((k) => pending.has(k)),
         };
-        return textResult(report(updated, step, previous));
+        return textResult(report(updated, step));
       } catch (error) {
         return errorResult(error instanceof Error ? error.message : "Unknown error.");
       }
@@ -208,7 +216,7 @@ function createServer() {
     {
       description:
         "Read the current PAD project, show all approved decisions, missing stages, and the next question. Requires state_json from the latest PAD response. Does not store anything.",
-      inputSchema: z.object({ state_json: z.string().min(1).max(16000) }),
+      inputSchema: z.object({ state_json: z.string().min(1).max(24000) }),
     },
     async ({ state_json }) => {
       try {
