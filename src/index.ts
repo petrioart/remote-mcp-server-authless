@@ -36,6 +36,7 @@ const planningSteps = [
   { key: "background_set", label: "Background and set", question: "What background, set, or compositing elements complete the scene?" },
   { key: "full_scene_preview", label: "Full scene preview", question: "Has the intended full-scene preview been reviewed and approved?" },
 ] as const;
+
 function createServer() {
   const server = new McpServer({
     name: "Portrait AI Director - MCP Prototype",
